@@ -1,0 +1,859 @@
+#!/usr/bin/env bash
+
+declare -A args=(
+  ["cmd"]=""
+  ["subcmd"]=""
+  ["private_subnet_id"]=""
+  ["public_subnet_id"]=""
+  ["security_group_id"]=""
+)
+
+# A registry of set Terraform variables.
+declare -A tfvars
+
+aws_region="us-west-2"
+export AWS_DEFAULT_REGION=${aws_region}
+
+# The bastion config/state storage dir.
+bastion_dir=".bastion"
+# The file name the TF state is stored in.
+tfstate_filename="bastion.tfstate"
+# The terraform config file that will hold the dropped in TF config.
+tfconfig_filename="bastion.config.tf"
+# The input variable file.
+tfvars_filename="bastion.tfvars"
+# The SSH private key for the bastion host.
+ssh_key_filename="bastion_ssh_id"
+
+# The Terraform config needed by bastion.
+read -r -d '' bastion_tfconfig <<'EOS'
+variable "bastion_network_acl_entry_number" {
+  type = "string"
+}
+
+variable "bastion_network_acl_ephemeral_entry_number" {
+  type = "string"
+}
+
+variable "client_ip_address" {
+  type = "string"
+}
+
+variable "private_network_acl" {
+  type = "string"
+}
+
+variable "private_network_acl_entry_number" {
+  type = "string"
+}
+
+variable "private_network_acl_ephemeral_entry_number" {
+  type = "string"
+}
+
+variable "public_network_acl" {
+  type = "string"
+}
+
+variable "public_network_acl_entry_number" {
+  type = "string"
+}
+
+variable "public_network_acl_ephemeral_entry_number" {
+  type = "string"
+}
+
+variable "public_subnet_id" {
+  type = "string"
+}
+
+variable "security_group_id" {
+  type = "string"
+}
+
+variable "vpc_id" {
+  type = "string"
+}
+
+// public_network_acl_rule provides the rule that allows the client IP
+// address connect to the bastion host.
+resource "aws_network_acl_rule" "public_network_acl_rule" {
+  network_acl_id = "${var.public_network_acl}"
+  rule_number    = "${var.public_network_acl_entry_number}"
+  egress         = false
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = "${var.client_ip_address}/32"
+  from_port      = 22
+  to_port        = 22
+}
+
+// public_network_acl_ephemeral_rule provides the ephemeral rule for 
+// public_network_acl_rule.
+resource "aws_network_acl_rule" "public_network_acl_ephemeral_rule" {
+  network_acl_id = "${var.public_network_acl}"
+  rule_number    = "${var.public_network_acl_ephemeral_entry_number}"
+  egress         = true
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = "${var.client_ip_address}/32"
+  from_port      = 1024
+  to_port        = 65535
+}
+
+// bastion_security_group provides the security group for the bastion host.
+resource "aws_security_group" "bastion_security_group" {
+  vpc_id = "${var.vpc_id}"
+}
+
+// bastion_security_group_rule_inbound enables inbound traffic from the
+// client IP address to the bastion host.
+resource "aws_security_group_rule" "bastion_security_group_rule_inbound" {
+  type              = "ingress"
+  protocol          = "tcp"
+  cidr_blocks       = ["${var.client_ip_address}/32"]
+  from_port         = "22"
+  to_port           = "22"
+  security_group_id = "${aws_security_group.bastion_security_group.id}"
+}
+
+// bastion_security_group_rule_outbound enables general outbound traffic from
+// the bastion host.
+resource "aws_security_group_rule" "bastion_security_group_rule_outbound" {
+  type              = "egress"
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  from_port         = "22"
+  to_port           = "22"
+  security_group_id = "${aws_security_group.bastion_security_group.id}"
+}
+
+// bastion_ami is a data-driven pseudo-resource that searches for
+// the latest amazon linux AMI for use as a image for launching the bastion
+// host.
+data "aws_ami" "bastion_ami" {
+  most_recent = true
+
+  filter {
+    name   = "owner-id"
+    values = ["137112412989"]
+  }
+
+  filter {
+    name   = "owner-alias"
+    values = ["amazon"]
+  }
+
+  filter {
+    name   = "name"
+    values = ["amzn-ami-hvm-*.x86_64-gp2"]
+  }
+
+  filter {
+    name   = "description"
+    values = ["Amazon Linux AMI * x86_64 HVM GP2"]
+  }
+}
+
+// bastion_private_key creates a private key for use as a key pair to the
+// bastion host.
+resource "tls_private_key" "bastion_private_key" {
+  algorithm = "RSA"
+  rsa_bits  = "4096"
+}
+
+// bastion_key_pair uploads the public key for bastion_private_key to AWS.
+//
+// note that the MD5 hashing here does not represent any attempt at security,
+// but is a measure to provide an adequately unique key name to avoid
+// collisions with other bastion states that could be running.
+resource "aws_key_pair" "bastion_key_pair" {
+  key_name   = "bastion-${md5(tls_private_key.bastion_private_key.public_key_openssh)}"
+  public_key = "${tls_private_key.bastion_private_key.public_key_openssh}"
+}
+
+// bastion_instance launches the bastion instance.
+resource "aws_instance" "bastion_instance" {
+  ami                         = "${data.aws_ami.bastion_ami.id}"
+  instance_type               = "t2.micro"
+  subnet_id                   = "${var.public_subnet_id}"
+  security_groups             = ["${aws_security_group.bastion_security_group.id}"]
+  associate_public_ip_address = true
+  key_name                    = "${aws_key_pair.bastion_key_pair.key_name}"
+}
+
+// bastion_network_acl_rule provides the rule that allows the bastion host to
+// connect to hosts over SSH.
+resource "aws_network_acl_rule" "bastion_network_acl_rule" {
+  network_acl_id = "${var.public_network_acl}"
+  rule_number    = "${var.bastion_network_acl_entry_number}"
+  egress         = true
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = "0.0.0.0/0"
+  from_port      = 22
+  to_port        = 22
+}
+
+// bastion_network_acl_ephemeral_rule provides the ephemeral rule for 
+// bastion_network_acl_rule.
+resource "aws_network_acl_rule" "bastion_network_acl_ephemeral_rule" {
+  network_acl_id = "${var.public_network_acl}"
+  rule_number    = "${var.bastion_network_acl_ephemeral_entry_number}"
+  egress         = false
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = "${aws_instance.bastion_instance.private_ip}/32"
+  from_port      = 1024
+  to_port        = 65535
+}
+
+// private_network_acl_rule provides the rule that allows the bastion host to
+// connect to the private network hosts.
+resource "aws_network_acl_rule" "private_network_acl_rule" {
+  network_acl_id = "${var.private_network_acl}"
+  rule_number    = "${var.private_network_acl_entry_number}"
+  egress         = false
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = "${aws_instance.bastion_instance.private_ip}/32"
+  from_port      = 22
+  to_port        = 22
+}
+
+// private_network_acl_ephemeral_rule provides the ephemeral rule for 
+// private_network_acl_rule.
+resource "aws_network_acl_rule" "private_network_acl_ephemeral_rule" {
+  network_acl_id = "${var.private_network_acl}"
+  rule_number    = "${var.private_network_acl_ephemeral_entry_number}"
+  egress         = true
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = "${aws_instance.bastion_instance.private_ip}/32"
+  from_port      = 1024
+  to_port        = 65535
+}
+
+// private_security_group_rule_inbound enables inbound traffic from the
+// bastion on the security group attached to the instances that need to be
+// connected to.
+resource "aws_security_group_rule" "private_security_group_rule_inbound" {
+  type              = "ingress"
+  protocol          = "tcp"
+  cidr_blocks       = ["${aws_instance.bastion_instance.private_ip}/32"]
+  from_port         = "22"
+  to_port           = "22"
+  security_group_id = "${var.security_group_id}"
+}
+
+// The public IP address of the bastion host.
+output "bastion_public_ip" {
+  value = "${aws_instance.bastion_instance.public_ip}"
+}
+
+// The bastion instance ID.
+output "bastion_instance_id" {
+  value = "${aws_instance.bastion_instance.id}"
+}
+
+// The bastion instance ID.
+output "bastion_private_key" {
+  value     = "${tls_private_key.bastion_private_key.private_key_pem}"
+  sensitive = true
+}
+EOS
+
+# message prints text with a color, redirected to stderr in the event of
+# warning or error messages.
+message() {
+  declare -A __colors=(
+    ["error"]="31"   # red
+    ["warning"]="33" # yellow
+    ["begin"]="32"   # green
+    ["ok"]="32"      # green
+    ["info"]="1"     # bold
+    ["reset"]="0"    # here just to note reset code
+  )
+  local __type="$1"
+  local __message="$2"
+  if [ -z "${__colors[$__type]}" ]; then
+    __type="info"
+  fi
+  if [[ ! "${__type}" =~ ^(warning|error)$ ]]; then
+    echo -e "\e[${__colors[$__type]}m${__message}\e[0m" 1>&2
+  else
+    echo -e "\e[${__colors[$__type]}m${__message}\e[0m"
+  fi
+}
+
+# exit_if_error prints an error message and exits on a non-zero error code.
+exit_if_error() {
+  local __status=$1
+  local __command=$2
+  if [ "${__status}" != "0" ]; then
+    message error "ERROR: ${__command} exited with code ${__status}"
+    exit 1
+  fi
+}
+
+# index checks an array for a specific element and returns the index of the
+# first match. no data is returned if there is not a match.
+index() {
+  local __e=""
+  local __i=0
+  for __e in "${@:2}"; do
+    if [ "${__e}" == "$1" ]; then
+      echo "${__i}"
+      return
+      ((__i++))
+    fi
+  done
+}
+
+# qsort quicksorts positional arguments and returns the matches as a
+# space-delimited string.
+qsort() {
+  local __pivot __i __smaller=() __larger=()
+  local __qsort_ret=()
+  if [ "$#" -eq "0" ]; then
+   return
+  fi
+  __pivot=$1
+  shift
+  for __i; do
+    if [[ $__i < $__pivot ]]; then
+       __smaller+=( "$__i" )
+    else
+       __larger+=( "$__i" )
+    fi
+  done
+  read -r -a __qsort_ret <<< "$(qsort "${__smaller[@]}")"
+  __smaller=( "${__qsort_ret[@]}" )
+  read -r -a __qsort_ret <<< "$(qsort "${__larger[@]}")"
+  __larger=( "${__qsort_ret[@]}" )
+  __qsort_ret=( "${__smaller[@]}" "$__pivot" "${__larger[@]}" )
+  echo "${__qsort_ret[@]}"
+}
+
+# set_tfvars takes two space-separated arguments, and exports the values in $2
+# to the tfvars file with the keys in $1.
+#
+# The tfvars global is also populated with these options so that other
+# functions can reference the options.
+set_tfvars() {
+  read -r -a __keys <<< "$1"
+  read -r -a __values <<< "$2"
+  local __n=0
+  local __end=$((${#__keys[@]}-1))
+  while [ "${__n}" -le "${__end}" ]; do
+    message info "Setting ${__keys[$__n]} to ${__values[$__n]}"
+    echo "${__keys[$__n]} = \"${__values[$__n]}\"" >> "${bastion_dir}/${tfvars_filename}"
+    tfvars[${__keys[$__n]}]="${__values[$__n]}"
+    ((__n++))
+  done
+}
+
+# clear_tfvars clears out the .tfvars file for bastion, so that set_tfvars
+# can write to it cleanly.
+clear_tfvars() {
+  message begin "==> Clearing tfvars file <=="
+  echo "" > "${bastion_dir}/${tfvars_filename}"
+  exit_if_error $? "Clearing tfvars file"
+  message info "${bastion_dir}/${tfvars_filename} cleared."
+  tfvars=()
+}
+
+# get_tf_output gets an output from the bastion Terraform state.
+get_tf_output() {
+  local __key="$1"
+  local __value=""
+  local __code=0
+  __value=$(terraform output -state "${bastion_dir}/${tfstate_filename}" "${__key}")
+  __code=$?
+  echo "${__value}"
+  return ${__code}
+}
+
+# help prints help.
+help() {
+  message error "$(cat <<EOS
+    Usage: $0 OPTIONS COMMAND
+
+    Options are:
+
+      --private-subnet-id ID      The subnet ID for the private subnet.
+      --public-subnet-id ID       The subnet ID for the public subnet.
+      --security-group-id ID      The security group ID to allow the bastion
+                                  host on.
+
+    COMMAND is one of the following:
+
+      launch                      Launch the bastion host and create the rules
+      ssh [USER@HOST]             SSH to a host behind the bastion.
+                                  If USER@HOST is blank, SSH to the bastion
+                                  itself.
+      terminate                   Terminates the bastion host, and removes
+                                  rules.
+EOS
+  )"
+}
+
+# arg_parse parses arguments.
+arg_parse() {
+  if [ "$#" == "0" ]; then
+    message error "ERROR: No arguments supplied."
+    help
+    exit 1
+  fi
+  while (( "$#" )); do
+    case $1 in
+      --private-subnet-id)
+        shift
+        args[private_subnet_id]=$1
+        ;;
+      --public-subnet-id)
+        shift
+        args[public_subnet_id]=$1
+        ;;
+      --security-group-id)
+        shift
+        args[security_group_id]=$1
+        ;;
+      -*)
+        message error "ERROR: Invalid argument: $1"
+        help
+        exit 1
+        ;;
+      *)
+        args[cmd]=$1
+        if [[ "$2" != -* ]]; then
+          shift
+          args[subcmd]=$1
+        fi
+        ;;
+    esac
+    shift
+  done
+}
+
+# validate_launchargs ensures that all or none of the subnet and security
+# group args are specified.
+validate_launchargs() {
+  declare -a __args=(private_subnet_id public_subnet_id security_group_id)
+  local __n=0
+  for __arg in ${__args[*]}; do
+    if [ ! -z "${args[$__arg]}" ]; then
+      ((__n++))
+    fi
+  done
+
+  if [ "${__n}" -ne "${#__args[@]}" ]; then
+    message error "ERROR: partial subnet and security group options specified, all are required"
+    help
+    exit 1
+  fi
+}
+
+# validate_sshargs validates that the second command arg for the SSH
+# command follows a user@host format.
+validate_sshargs() {
+  local __user=""
+  local __host=""
+
+  if [ "${args[cmd]}" != "ssh" ]; then
+    return
+  fi
+  if [ -z "${args[subcmd]}" ]; then
+    return
+  fi
+
+  IFS="@" read -r __user __host <<< "${args[subcmd]}"
+  if [ -z "${__host}" ]; then
+    message error "ERROR: SSH arg should be in user@host format"
+    exit 1
+  fi
+  if [[ ! "${__host}" =~ ^[.a-zA-Z0-9]+$ ]]; then
+    message error "ERROR: Bad hostname supplied: ${__host}"
+    exit 1
+  fi
+ }
+
+
+# validate cmd ensures that the command is supported.
+validate_cmd() {
+  declare -A __commands=(
+    ["launch"]="true"
+    ["ssh"]="true"
+    ["terminate"]="true"
+  )
+  if [ -z "${args[cmd]}" ]; then
+    message error "ERROR: No command supplied"
+    help
+    exit 1
+  fi
+
+  local __cmd="${args[cmd]}"
+  local __valid=${__commands[$__cmd]}
+ 
+  if [ -z "${__valid}" ]; then
+    message error "ERROR: Unknown command: ${__cmd}"
+    help
+    exit 1
+  fi
+}
+
+# cfg_init ensures the .bastion directory and relevant config files exist.
+cfg_init() {
+  message begin "==> Initializating configuration <=="
+  if [ -d "${bastion_dir}" ]; then
+    message info "Config directory ${bastion_dir} exists."
+  else
+    mkdir "${bastion_dir}"
+    exit_if_error $? "Creating ${bastion_dir} directory"
+    message info "Config directory ${bastion_dir} created."
+  fi
+
+  
+  if [ -f "${bastion_dir}/${tfconfig_filename}" ]; then
+    message info "Terraform config at ${bastion_dir}/${tfconfig_filename} already exists."
+  else 
+    echo "${bastion_tfconfig}" > "${bastion_dir}/${tfconfig_filename}"
+    exit_if_error $? "Writing Terraform config"
+    message info "Terraform config written to ${bastion_dir}/${tfconfig_filename}."
+  fi
+}
+
+# nacl_for_subnet looks up the network ACL ID for a subnet.
+nacl_for_subnet() {
+  local __subnet_id=$1
+  local __output=""
+
+  __output=$(
+    aws ec2 describe-network-acls \
+      --filters Name=association.subnet-id,Values="${__subnet_id}" \
+      --query "NetworkAcls[0].[NetworkAclId]" --output text
+  )
+  exit_if_error $? "aws ec2 describe-network-acls"
+  echo "${__output}"
+}
+
+# free_nacl_rules looks up the first free rule for a network ACL.
+free_nacl_rules() {
+  local __subnet_id=$1
+  local __egress=$2
+  local __entries_needed=$3
+  local __egbang=""
+  local __output=""
+  local __free_entries=()
+  local __n=1
+  local __nacl_id=""
+
+  if [ "${__egress}" != "true" ]; then
+    __egbang="!"
+  fi
+
+  __nacl_id=$(nacl_for_subnet "${__subnet_id}")
+  exit_if_error $? "Locating ACL for subnet ID ${__subnet_id}"
+
+  __output=$(
+    aws ec2 describe-network-acls \
+      --network-acl-ids "${__nacl_id}" \
+      --query "NetworkAcls[0].[Entries[?${__egbang}Egress].RuleNumber]" --output text
+
+  )
+  exit_if_error $? "aws ec2 describe-network-acls"
+ 
+  # shellcheck disable=SC2086
+  read -r -a __rule_ids <<< "$(qsort ${__output})"
+
+  while [ "${#__free_entries[@]}" -lt "${__entries_needed}" ] && [ "${__n}" -le "32766" ]; do
+    if [ -z "$(index ${__n} "${__rule_ids[@]}")" ]; then
+      __free_entries+=("${__n}")
+    fi
+    ((__n++))
+  done
+
+  if [ "${#__free_entries[@]}" -lt "${__entries_needed}" ]; then
+    message error "ERROR: Not enough free network ACL entries to satisfy request"
+    exit 1
+  fi
+
+  echo "${__free_entries[@]}"
+}
+
+# vpc_for_subnet gets the VPC ID for a subnet.
+vpc_for_subnet() {
+  local __subnet_id=$1
+  local __output=""
+
+  __output=$(
+    aws ec2 describe-subnets \
+      --subnet-ids "${__subnet_id}" \
+      --query "Subnets[0].[VpcId]" --output text
+  )
+  exit_if_error $? "aws ec2 describe-subnets"
+  echo "${__output}"
+}
+
+# check_for_running checks to see if there is a bastion instance launched
+# already. If so, it supplies the IP address.
+check_for_running() {
+  local __should_be_running="$1"
+  local __instance_id=""
+  local __ipaddr=""
+  __instance_id=$(get_tf_output bastion_instance_id 2>/dev/null)
+  __ipaddr=$(get_tf_output bastion_public_ip 2>/dev/null)
+
+  if [ ! -z "${__instance_id}" ] && [ "${__should_be_running}" != "true" ]; then
+    message yellow "$(cat <<EOS
+
+There appears to already be a bastion instance running.
+
+ Instance ID: ${__instance_id}
+ IP Address:  ${__ipaddr}
+
+If you think this is in error, it is possible that you have a inconsistent
+Terraform state.
+
+You can:
+ * Log into the instance with "bastion ssh".
+ * Terminate the instance with "bastion terminate".
+ * Manually delete the instance and all other artifacts, and try again.
+
+EOS
+)"
+  exit 1
+  fi
+  if [ -z "${__instance_id}" ] && [ "${__should_be_running}" == "true" ]; then
+    message error "$(cat <<EOS
+
+There does not appear to be a running instance. Start one with
+"bastion launch" and try again.
+EOS
+)"
+  exit 1
+  fi
+}
+
+# populate_vpcargs ensures that the subnets in private_subnet_id and 
+# public_subnet_id have the same VPC, and sets the vpc_id varible.
+#
+# This function uses private_subnet_id and 
+# public_subnet_id from tfvars to ensure that we catch ones that are set
+# thru Terraform state as well.
+populate_vpcargs() {
+  local __private_vpc_id=""
+  local __public_vpc_id=""
+  message begin "==> Validating VPC for private and public subnets <=="
+  # shellcheck disable=SC2154
+  __private_vpc_id=$(vpc_for_subnet "${tfvars[private_subnet_id]}")
+  exit_if_error $? "private VPC check"
+  # shellcheck disable=SC2154
+  __public_vpc_id=$(vpc_for_subnet "${tfvars[public_subnet_id]}")
+  exit_if_error $? "public VPC check"
+  if [ "${__private_vpc_id}" != "${__public_vpc_id}" ]; then
+    message error "ERROR: private VPC (${__private_vpc_id}) is not the same as as the public (${__public_vpc_id})"
+    exit 1
+  fi
+  set_tfvars "vpc_id" "${__private_vpc_id}"
+}
+
+# populate_netargs populates private_subnet_id, private_subnet_id, and
+# security_group_id from arguments.
+populate_netargs() {
+  message begin "==> Setting network launch arguments <=="
+  local __args=(private_subnet_id public_subnet_id security_group_id)
+  local __values=()
+  local __value=""
+
+  for __arg in "${__args[@]}"; do
+    __values+=("${args[$__arg]}")
+  done
+  set_tfvars "${__args[*]}" "${__values[*]}"
+}
+
+# populate_network_acl_entries gets the vacant network ACL entry numbers and
+# sets them for the appropriate inbound, outbound, and ephemeral rules.
+populate_network_acl_entries() {
+  message begin "==> Locating free network ACL entry numbers <=="
+  local __public_entry_numbers_ingress=()
+  local __public_entry_numbers_egress=()
+  local __private_entry_numbers_ingress=()
+  local __private_entry_numbers_egress=()
+  local __out=""
+
+  # public needs 2 rules ingress/egress for public access and bastion outbound.
+  __out="$(free_nacl_rules "${tfvars[public_subnet_id]}" "false" "2")"
+  exit_if_error $? "Looking for free ingress rules in public subnet"
+  read -r -a __public_entry_numbers_ingress <<< "${__out}"
+  set_tfvars "public_network_acl_entry_number bastion_network_acl_ephemeral_entry_number" "${__public_entry_numbers_ingress[*]}"
+
+  __out="$(free_nacl_rules "${tfvars[public_subnet_id]}" "true" "2")"
+  exit_if_error $? "Looking for free egress rules in public subnet"
+  read -r -a __public_entry_numbers_egress <<< "${__out}"
+  set_tfvars "public_network_acl_ephemeral_entry_number bastion_network_acl_entry_number" "${__public_entry_numbers_egress[*]}"
+
+  # private just needs one ingress and one egress.
+  __out="$(free_nacl_rules "${tfvars[private_subnet_id]}" "false" "1")"
+  exit_if_error $? "Looking for free ingress rules in private subnet"
+  read -r -a __private_entry_numbers_ingress <<< "${__out}"
+  set_tfvars "private_network_acl_entry_number" "${__private_entry_numbers_ingress[*]}"
+
+  __out="$(free_nacl_rules "${tfvars[private_subnet_id]}" "true" "1")"
+  exit_if_error $? "Looking for free egress rules in private subnet"
+  read -r -a __private_entry_numbers_egress <<< "${__out}"
+  set_tfvars "private_network_acl_ephemeral_entry_number" "${__private_entry_numbers_egress[*]}"
+}
+
+# populate_ip_address gets the current public IP address from https://api.ipify.org/.
+populate_ip_address() {
+  message begin "==> Checking public IP address <=="
+  local __ipaddr=""
+  __ipaddr=$(curl --silent https://api.ipify.org/)
+  exit_if_error $? "curl https://api.ipify.org/"
+  set_tfvars "client_ip_address" "${__ipaddr}"
+}
+
+# populate_network_acls gets the network ACL IDs for the subnets defined.
+#
+# This function uses private_subnet_id and 
+# public_subnet_id from tfvars to ensure that we catch ones that are set
+# through Terraform state as well.
+populate_network_acls() {
+  message begin "==> Locating network ACLs for subnets <=="
+  local __arg=""
+  local __sources=("${tfvars[private_subnet_id]}" "${tfvars[public_subnet_id]}")
+  local __args=(private_network_acl public_network_acl)
+  local __acls=()
+  local __out=""
+
+  for __arg in "${__sources[@]}"; do
+    __out=$(nacl_for_subnet "${__arg}")
+    exit_if_error $? "Locating ACL for subnet ID ${__arg}"
+    __acls+=("${__out}")
+  done
+
+  set_tfvars "${__args[*]}" "${__acls[*]}"
+}
+
+# populate_launchargs gathers all of the arguments needed to run Terraform and
+# sets them in the tfvars file.
+populate_launchargs() {
+  clear_tfvars
+  populate_netargs
+  populate_network_acls
+  populate_vpcargs
+  populate_network_acl_entries
+  populate_ip_address
+}
+
+# save_private_key saves the private key from the bastion_private_key output
+# to a file for use with SSH.
+save_private_key() {
+  local __key=""
+  message begin "==> Saving bastion host private key <=="
+  __key=$(get_tf_output bastion_private_key)
+  exit_if_error $? "Looking for private key"
+  echo "${__key}" > "${bastion_dir}/${ssh_key_filename}"
+  exit_if_error $? "Saving private key"
+  chmod "600" "${bastion_dir}/${ssh_key_filename}"
+  exit_if_error $? "Saving private key"
+  message info "Saved private key to ${bastion_dir}/${ssh_key_filename}."
+}
+
+# build_ssh_command builds the SSH command line, based on if $1 is empty or
+# not.
+build_ssh_command() {
+  local __cmd=("ssh")
+  local __userhost="$1"
+  local __user=""
+  local __host=""
+  local __bastion_host_address=""
+
+  __bastion_host_address=$(get_tf_output bastion_public_ip)
+  exit_if_error $? "Locating bastion host address"
+
+  if [ ! -z "${__userhost}" ]; then
+    # shellcheck disable=SC2034
+    IFS="@" read -r __user __host <<< "${__userhost}"
+    __cmd+=("-o" "ProxyCommand='ssh -i ${bastion_dir}/${ssh_key_filename} -q -W ${__host}:22 ec2-user@${__bastion_host_address}'" "${__userhost}")
+  else
+    __cmd+=("-i" "${bastion_dir}/${ssh_key_filename}" "ec2-user@${__bastion_host_address}")
+  fi
+  echo "${__cmd[*]}"
+}
+
+# run_tf runs the terraform apply operation to launch the instance.
+run_tf() {
+  local __op=($@)
+  message begin "==> Running Terraform operation (terraform ${__op[*]}) <=="
+  terraform "${__op[@]}" -var-file="${bastion_dir}/${tfvars_filename}" -state "${bastion_dir}/${tfstate_filename}" "${bastion_dir}" 
+  exit_if_error $? "terraform ${__op[*]}"
+}
+
+# launch_run launches the bastion instance.
+launch_run() {
+  check_for_running "false"
+  message begin "==> Launching bastion instance <=="
+  populate_launchargs
+  run_tf "apply" "-input=false" 
+  
+  message ok "$(cat <<EOS
+
+  
+Bastion host launched. Check the Terraform output for the IP address to
+connect to, or run "bastion ssh" to connect automatically. SSH may not be
+available on the instance immediately.
+EOS
+)"
+}
+
+# terminate_run terminates the bastion instance.
+terminate_run() {
+  message begin "==> Terminating bastion instance and removing rules <=="
+  run_tf "destroy" "-force" "-input=false"
+  
+  message ok "$(cat <<EOS
+
+  
+Bastion host terminated.
+EOS
+)"
+}
+
+# ssh_run connects to the bastion host over SSH, or a server behind it, if supplied.
+ssh_run() {
+  local __ssh_host=${args[subcmd]}
+  local __ssh_cmd=""
+  check_for_running "true"
+
+  save_private_key
+  __ssh_cmd=$(build_ssh_command "${__ssh_host}")
+  exit_if_error $? "Building SSH command"
+
+  message begin "==> Running SSH (${__ssh_cmd}) <=="
+  eval "${__ssh_cmd}"
+}
+
+arg_parse "$@"
+validate_cmd
+validate_launchargs
+validate_sshargs
+
+case "${args[cmd]}" in
+  launch)
+    cfg_init
+    launch_run 
+    ;;
+  ssh)
+    ssh_run
+    ;;
+  terminate)
+    terminate_run
+    ;;
+  *)
+    message error "ERROR: noop"
+    help
+    exit 1
+    ;;
+esac

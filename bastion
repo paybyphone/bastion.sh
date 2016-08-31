@@ -837,7 +837,9 @@ ssh_run() {
 
 arg_parse "$@"
 validate_cmd
-validate_launchargs
+if [ "${args[cmd]}" == "launch" ]; then
+  validate_launchargs
+fi
 validate_sshargs
 
 case "${args[cmd]}" in

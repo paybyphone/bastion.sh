@@ -368,7 +368,7 @@ get_tf_output() {
   local __key="$1"
   local __value=""
   local __code=0
-  __value=$(terraform output -state "${bastion_dir}/${tfstate_filename}" "${__key}")
+  __value=$(cd "${bastion_dir}" && terraform output -state "${tfstate_filename}" "${__key}")
   __code=$?
   echo "${__value}"
   return ${__code}
@@ -787,7 +787,7 @@ build_ssh_command() {
 run_tf() {
   local __op=($@)
   message begin "==> Running Terraform operation (terraform ${__op[*]}) <=="
-  terraform "${__op[@]}" -var-file="${bastion_dir}/${tfvars_filename}" -state "${bastion_dir}/${tfstate_filename}" "${bastion_dir}" 
+  (cd "${bastion_dir}" && terraform "${__op[@]}" -var-file="${tfvars_filename}" -state "${tfstate_filename}")
   exit_if_error $? "terraform ${__op[*]}"
 }
 

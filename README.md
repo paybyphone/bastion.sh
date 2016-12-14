@@ -61,6 +61,11 @@ that Terraform 0.7+ is also required!
       --public-subnet-id ID       The subnet ID for the public subnet.
       --security-group-id ID      The security group ID to allow the bastion
                                   host on.
+      --ami-id ID                 Supply a custom AMI to use for the bastion
+                                  host. Required when using --bastion-user.
+      --bastion-user USER         Supply a custom login user for logging in to
+                                  the bastion host. Required when using
+                                  --ami-id.
 
     COMMAND is one of the following:
 

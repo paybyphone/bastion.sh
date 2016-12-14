@@ -6,6 +6,8 @@ declare -A args=(
   ["private_subnet_id"]=""
   ["public_subnet_id"]=""
   ["security_group_id"]=""
+  ["ami_id"]=""
+  ["bastion_user"]=""
 )
 
 # A registry of set Terraform variables.
@@ -75,6 +77,16 @@ variable "vpc_id" {
   type = "string"
 }
 
+variable "ami_id" {
+  type    = "string"
+  default = ""
+}
+
+variable "bastion_user" {
+  type    = "string"
+  default = ""
+}
+
 // public_network_acl_rule provides the rule that allows the client IP
 // address connect to the bastion host.
 resource "aws_network_acl_rule" "public_network_acl_rule" {
@@ -128,10 +140,9 @@ resource "aws_security_group_rule" "bastion_security_group_rule_outbound" {
   security_group_id = "${aws_security_group.bastion_security_group.id}"
 }
 
-// bastion_ami is a data-driven pseudo-resource that searches for
-// the latest amazon linux AMI for use as a image for launching the bastion
-// host.
-data "aws_ami" "bastion_ami" {
+// bastion_ami_amazon is a data-driven pseudo-resource that searches for the
+// latest amazon linux AMI for use as a image for launching the bastion host.
+data "aws_ami" "bastion_ami_amazon" {
   most_recent = true
 
   filter {
@@ -174,7 +185,7 @@ resource "aws_key_pair" "bastion_key_pair" {
 
 // bastion_instance launches the bastion instance.
 resource "aws_instance" "bastion_instance" {
-  ami                         = "${data.aws_ami.bastion_ami.id}"
+  ami                         = "${var.ami_id == "" ? data.aws_ami.bastion_ami_amazon.id : var.ami_id}"
   instance_type               = "t2.micro"
   subnet_id                   = "${var.public_subnet_id}"
   security_groups             = ["${aws_security_group.bastion_security_group.id}"]
@@ -260,6 +271,11 @@ output "bastion_instance_id" {
 output "bastion_private_key" {
   value     = "${tls_private_key.bastion_private_key.private_key_pem}"
   sensitive = true
+}
+
+// The user ID to log into the bastion host with.
+output "bastion_user" {
+  value = "${var.bastion_user != "" ? var.bastion_user : "ec2-user"}"
 }
 EOS
 
@@ -385,6 +401,11 @@ help() {
       --public-subnet-id ID       The subnet ID for the public subnet.
       --security-group-id ID      The security group ID to allow the bastion
                                   host on.
+      --ami-id ID                 Supply a custom AMI to use for the bastion
+                                  host. Required when using --bastion-user.
+      --bastion-user USER         Supply a custom login user for logging in to
+                                  the bastion host. Required when using
+                                  --ami-id.
 
     COMMAND is one of the following:
 
@@ -419,6 +440,14 @@ arg_parse() {
         shift
         args[security_group_id]=$1
         ;;
+      --ami-id)
+        shift
+        args[ami_id]=$1
+        ;;
+      --bastion-user)
+        shift
+        args[bastion_user]=$1
+        ;;
       -*)
         message error "ERROR: Invalid argument: $1"
         help
@@ -436,8 +465,9 @@ arg_parse() {
   done
 }
 
-# validate_launchargs ensures that all or none of the subnet and security
-# group args are specified.
+# validate_launchargs ensures that all or none of the subnet and security group
+# args are specified, and that both --ami-id and --bastion-user are used if a
+# custom AMI is requested.
 validate_launchargs() {
   declare -a __args=(private_subnet_id public_subnet_id security_group_id)
   local __n=0
@@ -450,6 +480,15 @@ validate_launchargs() {
   if [ "${__n}" -ne "${#__args[@]}" ]; then
     message error "ERROR: partial subnet and security group options specified, all are required"
     help
+    exit 1
+  fi
+  
+  if [ -z "${args[ami_id]}" ] && [ -n "${args[bastion_user]}" ]; then
+    message error "ERROR: ami_id and bastion_user both need to be set to use a custom AMI"
+    exit 1
+  fi
+  if [ -n "${args[ami_id]}" ] && [ -z "${args[bastion_user]}" ]; then
+    message error "ERROR: ami_id and bastion_user both need to be set to use a custom AMI"
     exit 1
   fi
 }
@@ -476,8 +515,7 @@ validate_sshargs() {
     message error "ERROR: Bad hostname supplied: ${__host}"
     exit 1
   fi
- }
-
+}
 
 # validate cmd ensures that the command is supported.
 validate_cmd() {
@@ -736,6 +774,19 @@ populate_network_acls() {
   set_tfvars "${__args[*]}" "${__acls[*]}"
 }
 
+# populate_custom_bastion_info sets the information for a custom bastion AMI
+# and user.
+populate_custom_bastion_info() {
+  message begin "==> Adding custom bastion info (if present) <=="
+  if [ -n "${args[ami_id]}" ]; then
+    set_tfvars "ami_id" "${args[ami_id]}"
+  fi
+  
+  if [ -n "${args[bastion_user]}" ]; then
+    set_tfvars "bastion_user" "${args[bastion_user]}"
+  fi
+}
+
 # populate_launchargs gathers all of the arguments needed to run Terraform and
 # sets them in the tfvars file.
 populate_launchargs() {
@@ -745,6 +796,7 @@ populate_launchargs() {
   populate_vpcargs
   populate_network_acl_entries
   populate_ip_address
+  populate_custom_bastion_info
 }
 
 # save_private_key saves the private key from the bastion_private_key output
@@ -769,16 +821,20 @@ build_ssh_command() {
   local __user=""
   local __host=""
   local __bastion_host_address=""
+  local __bastion_login_user=""
 
   __bastion_host_address=$(get_tf_output bastion_public_ip)
   exit_if_error $? "Locating bastion host address"
+  
+  __bastion_login_user=$(get_tf_output bastion_user)
+  exit_if_error $? "Locating bastion login user"
 
   if [ ! -z "${__userhost}" ]; then
     # shellcheck disable=SC2034
     IFS="@" read -r __user __host <<< "${__userhost}"
-    __cmd+=("-o" "ProxyCommand='ssh -i ${bastion_dir}/${ssh_key_filename} -q -W ${__host}:22 ec2-user@${__bastion_host_address}'" "${__userhost}")
+    __cmd+=("-o" "ProxyCommand='ssh -i ${bastion_dir}/${ssh_key_filename} -q -W ${__host}:22 ${__bastion_login_user}@${__bastion_host_address}'" "${__userhost}")
   else
-    __cmd+=("-i" "${bastion_dir}/${ssh_key_filename}" "ec2-user@${__bastion_host_address}")
+    __cmd+=("-i" "${bastion_dir}/${ssh_key_filename}" "${__bastion_login_user}@${__bastion_host_address}")
   fi
   echo "${__cmd[*]}"
 }

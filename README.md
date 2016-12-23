@@ -9,6 +9,30 @@ Extreme AWS bastion hosting, with a little help from our friends:
 
 PS: You need these tools to run this script. :)
 
+## WARNING
+
+This script is in a bit of a state of flux right now - namely the network ACL
+support is in the process of being dropped as network ACLs are way too much of a
+pain to manage and most use cases do not need them at all.
+
+While this script is in this transitional state, **network ACL rules will be
+created that allow all traffic in and out of the respective looked up network
+ACLs**.
+
+Note that this is different than security groups, where we still adopt a fairly
+secure model, with a few modifications to increase the utility of the bastion:
+
+ * Only SSH access is allowed inbound from the discovered client IP address.
+ * *All* traffic from the security group created for the bastion host is allowed
+   on the security group that's the target of the bastion script.
+
+Eventually, network ACL functionality will be dropped completely. At that point
+in time, it will be up to you to ensure that your VPCs are set up properly to
+allow the bastion traffic if you use network ACLs.
+
+If you don't like this functionality and were happy with the way things were
+before, use the v0.2.0 or earlier releases.
+
 ## Synopsis
 
 Bastion hosting is a popular concept when using Amazon EC2. It's a host that

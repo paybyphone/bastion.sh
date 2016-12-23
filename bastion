@@ -5,7 +5,7 @@ declare -A args=(
   ["subcmd"]=""
   ["private_subnet_id"]=""
   ["public_subnet_id"]=""
-  ["security_group_id"]=""
+  ["security_group_ids"]=""
   ["ami_id"]=""
   ["bastion_user"]=""
 )
@@ -29,14 +29,6 @@ ssh_key_filename="bastion_ssh_id"
 
 # The Terraform config needed by bastion.
 read -r -d '' bastion_tfconfig <<'EOS'
-variable "bastion_network_acl_entry_number" {
-  type = "string"
-}
-
-variable "bastion_network_acl_ephemeral_entry_number" {
-  type = "string"
-}
-
 variable "client_ip_address" {
   type = "string"
 }
@@ -69,7 +61,7 @@ variable "public_subnet_id" {
   type = "string"
 }
 
-variable "security_group_id" {
+variable "security_group_ids" {
   type = "string"
 }
 
@@ -87,30 +79,28 @@ variable "bastion_user" {
   default = ""
 }
 
-// public_network_acl_rule provides the rule that allows the client IP
-// address connect to the bastion host.
+// public_network_acl_rule temporarily opens up all inbound access to the
+// public network ACL. Note that this does not affect any operational security
+// groups in the VPC.
 resource "aws_network_acl_rule" "public_network_acl_rule" {
   network_acl_id = "${var.public_network_acl}"
   rule_number    = "${var.public_network_acl_entry_number}"
   egress         = false
-  protocol       = "tcp"
+  protocol       = "-1"
   rule_action    = "allow"
-  cidr_block     = "${var.client_ip_address}/32"
-  from_port      = 22
-  to_port        = 22
+  cidr_block     = "0.0.0.0/0"
 }
 
-// public_network_acl_ephemeral_rule provides the ephemeral rule for 
-// public_network_acl_rule.
+// public_network_acl_ephemeral_rule temporarily opens up all outbound access
+// to the public network ACL. Note that this does not affect any operational
+// security groups in the VPC.
 resource "aws_network_acl_rule" "public_network_acl_ephemeral_rule" {
   network_acl_id = "${var.public_network_acl}"
   rule_number    = "${var.public_network_acl_ephemeral_entry_number}"
   egress         = true
-  protocol       = "tcp"
+  protocol       = "-1"
   rule_action    = "allow"
-  cidr_block     = "${var.client_ip_address}/32"
-  from_port      = 1024
-  to_port        = 65535
+  cidr_block     = "0.0.0.0/0"
 }
 
 // bastion_security_group provides the security group for the bastion host.
@@ -133,10 +123,10 @@ resource "aws_security_group_rule" "bastion_security_group_rule_inbound" {
 // the bastion host.
 resource "aws_security_group_rule" "bastion_security_group_rule_outbound" {
   type              = "egress"
-  protocol          = "tcp"
+  protocol          = "all"
   cidr_blocks       = ["0.0.0.0/0"]
-  from_port         = "22"
-  to_port           = "22"
+  from_port         = "0"
+  to_port           = "0"
   security_group_id = "${aws_security_group.bastion_security_group.id}"
 }
 
@@ -193,68 +183,43 @@ resource "aws_instance" "bastion_instance" {
   key_name                    = "${aws_key_pair.bastion_key_pair.key_name}"
 }
 
-// bastion_network_acl_rule provides the rule that allows the bastion host to
-// connect to hosts over SSH.
-resource "aws_network_acl_rule" "bastion_network_acl_rule" {
-  network_acl_id = "${var.public_network_acl}"
-  rule_number    = "${var.bastion_network_acl_entry_number}"
-  egress         = true
-  protocol       = "tcp"
-  rule_action    = "allow"
-  cidr_block     = "0.0.0.0/0"
-  from_port      = 22
-  to_port        = 22
-}
-
-// bastion_network_acl_ephemeral_rule provides the ephemeral rule for 
-// bastion_network_acl_rule.
-resource "aws_network_acl_rule" "bastion_network_acl_ephemeral_rule" {
-  network_acl_id = "${var.public_network_acl}"
-  rule_number    = "${var.bastion_network_acl_ephemeral_entry_number}"
-  egress         = false
-  protocol       = "tcp"
-  rule_action    = "allow"
-  cidr_block     = "${aws_instance.bastion_instance.private_ip}/32"
-  from_port      = 1024
-  to_port        = 65535
-}
-
-// private_network_acl_rule provides the rule that allows the bastion host to
-// connect to the private network hosts.
+// private_network_acl_rule temporarily opens up all inbound access to the
+// private network ACL. Note that this does not affect any operational security
+// groups in the VPC.
 resource "aws_network_acl_rule" "private_network_acl_rule" {
   network_acl_id = "${var.private_network_acl}"
   rule_number    = "${var.private_network_acl_entry_number}"
   egress         = false
-  protocol       = "tcp"
+  protocol       = "-1"
   rule_action    = "allow"
-  cidr_block     = "${aws_instance.bastion_instance.private_ip}/32"
-  from_port      = 22
-  to_port        = 22
+  cidr_block     = "0.0.0.0/0"
 }
 
-// private_network_acl_ephemeral_rule provides the ephemeral rule for 
-// private_network_acl_rule.
+// private_network_acl_ephemeral_rule temporarily opens up all outbound access
+// to the private network ACL. Note that this does not affect any operational
+// security groups in the VPC.
 resource "aws_network_acl_rule" "private_network_acl_ephemeral_rule" {
   network_acl_id = "${var.private_network_acl}"
   rule_number    = "${var.private_network_acl_ephemeral_entry_number}"
   egress         = true
-  protocol       = "tcp"
+  protocol       = "-1"
   rule_action    = "allow"
-  cidr_block     = "${aws_instance.bastion_instance.private_ip}/32"
-  from_port      = 1024
-  to_port        = 65535
+  cidr_block     = "0.0.0.0/0"
 }
 
 // private_security_group_rule_inbound enables inbound traffic from the
-// bastion on the security group attached to the instances that need to be
-// connected to.
+// bastion's security group to the target internal security group.
+//
+// This will allow the bastion to connect to any address/port on the target
+// security group.
 resource "aws_security_group_rule" "private_security_group_rule_inbound" {
-  type              = "ingress"
-  protocol          = "tcp"
-  cidr_blocks       = ["${aws_instance.bastion_instance.private_ip}/32"]
-  from_port         = "22"
-  to_port           = "22"
-  security_group_id = "${var.security_group_id}"
+  count                    = "${length(split(",", var.security_group_ids))}"
+  type                     = "ingress"
+  protocol                 = "all"
+  source_security_group_id = "${aws_security_group.bastion_security_group.id}"
+  from_port                = "0"
+  to_port                  = "0"
+  security_group_id        = "${element(split(",", var.security_group_ids), count.index)}"
 }
 
 // The public IP address of the bastion host.
@@ -399,8 +364,9 @@ help() {
 
       --private-subnet-id ID      The subnet ID for the private subnet.
       --public-subnet-id ID       The subnet ID for the public subnet.
-      --security-group-id ID      The security group ID to allow the bastion
-                                  host on.
+      --security-group-ids ID     The security group IDs to allow the bastion
+                                  host on. Separate multiple security groups
+                                  with commas.
       --ami-id ID                 Supply a custom AMI to use for the bastion
                                   host. Required when using --bastion-user.
       --bastion-user USER         Supply a custom login user for logging in to
@@ -436,9 +402,9 @@ arg_parse() {
         shift
         args[public_subnet_id]=$1
         ;;
-      --security-group-id)
+      --security-group-ids)
         shift
-        args[security_group_id]=$1
+        args[security_group_ids]=$1
         ;;
       --ami-id)
         shift
@@ -469,7 +435,7 @@ arg_parse() {
 # args are specified, and that both --ami-id and --bastion-user are used if a
 # custom AMI is requested.
 validate_launchargs() {
-  declare -a __args=(private_subnet_id public_subnet_id security_group_id)
+  declare -a __args=(private_subnet_id public_subnet_id security_group_ids)
   local __n=0
   for __arg in ${__args[*]}; do
     if [ ! -z "${args[$__arg]}" ]; then
@@ -697,10 +663,10 @@ populate_vpcargs() {
 }
 
 # populate_netargs populates private_subnet_id, private_subnet_id, and
-# security_group_id from arguments.
+# security_group_ids from arguments.
 populate_netargs() {
   message begin "==> Setting network launch arguments <=="
-  local __args=(private_subnet_id public_subnet_id security_group_id)
+  local __args=(private_subnet_id public_subnet_id security_group_ids)
   local __values=()
   local __value=""
 
@@ -720,16 +686,16 @@ populate_network_acl_entries() {
   local __private_entry_numbers_egress=()
   local __out=""
 
-  # public needs 2 rules ingress/egress for public access and bastion outbound.
-  __out="$(free_nacl_rules "${tfvars[public_subnet_id]}" "false" "2")"
+  # public just needs one ingress and one egress.
+  __out="$(free_nacl_rules "${tfvars[public_subnet_id]}" "false" "1")"
   exit_if_error $? "Looking for free ingress rules in public subnet"
   read -r -a __public_entry_numbers_ingress <<< "${__out}"
-  set_tfvars "public_network_acl_entry_number bastion_network_acl_ephemeral_entry_number" "${__public_entry_numbers_ingress[*]}"
+  set_tfvars "public_network_acl_entry_number" "${__public_entry_numbers_ingress[*]}"
 
-  __out="$(free_nacl_rules "${tfvars[public_subnet_id]}" "true" "2")"
+  __out="$(free_nacl_rules "${tfvars[public_subnet_id]}" "true" "1")"
   exit_if_error $? "Looking for free egress rules in public subnet"
   read -r -a __public_entry_numbers_egress <<< "${__out}"
-  set_tfvars "public_network_acl_ephemeral_entry_number bastion_network_acl_entry_number" "${__public_entry_numbers_egress[*]}"
+  set_tfvars "public_network_acl_ephemeral_entry_number" "${__public_entry_numbers_egress[*]}"
 
   # private just needs one ingress and one egress.
   __out="$(free_nacl_rules "${tfvars[private_subnet_id]}" "false" "1")"

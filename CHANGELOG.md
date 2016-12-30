@@ -1,3 +1,9 @@
+## v0.2.1
+
+Added the `upload` and `download` commands - these commands allow one to easily
+upload or download files to and from the bastion, or to and from hosts behind
+the bastion.
+
 ## v0.2.0
 
 This version requires Terraform v0.8.0 or higher - the tool will not work

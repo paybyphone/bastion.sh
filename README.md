@@ -83,8 +83,9 @@ that Terraform 0.7+ is also required!
 
       --private-subnet-id ID      The subnet ID for the private subnet.
       --public-subnet-id ID       The subnet ID for the public subnet.
-      --security-group-id ID      The security group ID to allow the bastion
-                                  host on.
+      --security-group-ids ID     The security group IDs to allow the bastion
+                                  host on. Separate multiple security groups
+                                  with commas.
       --ami-id ID                 Supply a custom AMI to use for the bastion
                                   host. Required when using --bastion-user.
       --bastion-user USER         Supply a custom login user for logging in to
@@ -93,12 +94,20 @@ that Terraform 0.7+ is also required!
 
     COMMAND is one of the following:
 
-      launch                      Launch the bastion host and create the rules
-      ssh [USER@HOST]             SSH to a host behind the bastion.
-                                  If USER@HOST is blank, SSH to the bastion
-                                  itself.
-      terminate                   Terminates the bastion host, and removes
-                                  rules.
+      launch                        Launch the bastion host and create the
+                                    rules.
+      ssh [USER@HOST]               SSH to a host behind the bastion.
+                                    If USER@HOST is blank, SSH to the bastion
+                                    itself.
+      upload SRC [USER@HOST:]DST    Upload data to the bastion, or to a host
+                                    behind it if the optional USER@HOST is
+                                    supplied.
+      download [USER@HOST:]SRC DST  Download data from the bastion, or from a
+                                    host behind it if the optional USER@HOST is
+                                    supplied.
+      terminate                     Terminates the bastion host, and removes
+                                    rules.
+
 ```
 
 Direct SSH connections to hosts behind the bastion are supported thru the use of

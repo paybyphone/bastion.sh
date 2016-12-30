@@ -8,6 +8,8 @@ declare -A args=(
   ["security_group_ids"]=""
   ["ami_id"]=""
   ["bastion_user"]=""
+  ["src"]=""
+  ["dst"]=""
 )
 
 # A registry of set Terraform variables.
@@ -375,12 +377,19 @@ help() {
 
     COMMAND is one of the following:
 
-      launch                      Launch the bastion host and create the rules
-      ssh [USER@HOST]             SSH to a host behind the bastion.
-                                  If USER@HOST is blank, SSH to the bastion
-                                  itself.
-      terminate                   Terminates the bastion host, and removes
-                                  rules.
+      launch                        Launch the bastion host and create the
+                                    rules.
+      ssh [USER@HOST]               SSH to a host behind the bastion.
+                                    If USER@HOST is blank, SSH to the bastion
+                                    itself.
+      upload SRC [USER@HOST:]DST    Upload data to the bastion, or to a host
+                                    behind it if the optional USER@HOST is
+                                    supplied.
+      download [USER@HOST:]SRC DST  Download data from the bastion, or from a
+                                    host behind it if the optional USER@HOST is
+                                    supplied.
+      terminate                     Terminates the bastion host, and removes
+                                    rules.
 EOS
   )"
 }
@@ -418,6 +427,18 @@ arg_parse() {
         message error "ERROR: Invalid argument: $1"
         help
         exit 1
+        ;;
+      upload|download)
+        args[cmd]=$1
+        if [[ "$2" == -* ]] || [[ "$3" == -* ]]; then
+          message error "ERROR: Malformed src or dest for upload/download command: $1 $2 $3"
+          help
+          exit 1
+        fi
+        shift
+        args[src]=$1
+        shift
+        args[dst]=$1
         ;;
       *)
         args[cmd]=$1
@@ -483,12 +504,27 @@ validate_sshargs() {
   fi
 }
 
+# validate_transferargs validates that the source or destinations for the
+# upload and download commands are not empty.
+validate_transferargs() {
+  if [ -z "${args[src]}" ]; then
+    message error "ERROR: src needs to be supplied for upload and download commands"
+    exit 1
+  fi
+  if [ -z "${args[dst]}" ]; then
+    message error "ERROR: dst needs to be supplied for upload and download commands"
+    exit 1
+  fi
+}
+
 # validate cmd ensures that the command is supported.
 validate_cmd() {
   declare -A __commands=(
     ["launch"]="true"
     ["ssh"]="true"
     ["terminate"]="true"
+    ["upload"]="true"
+    ["download"]="true"
   )
   if [ -z "${args[cmd]}" ]; then
     message error "ERROR: No command supplied"
@@ -805,6 +841,48 @@ build_ssh_command() {
   echo "${__cmd[*]}"
 }
 
+# build_scp_command builds the SCP command line for uploading and downloading.
+build_scp_command() {
+  local __cmd=("scp")
+  local __src="$1"
+  local __dst="$2"
+  local __userhost_src=""
+  local __userhost_dst=""
+  read -d ":" -r __userhost_src <<< "${__src}"
+  if [ "${__userhost_src}" == "${__src}" ]; then
+    __userhost_src=""
+  fi
+  read -d ":" -r __userhost_dst <<< "${__dst}"
+  if [ "${__userhost_dst}" == "${__dst}" ]; then
+    __userhost_dst=""
+  fi
+  local __user=""
+  local __host=""
+  local __bastion_host_address=""
+  local __bastion_login_user=""
+
+  __bastion_host_address=$(get_tf_output bastion_public_ip)
+  exit_if_error $? "Locating bastion host address"
+
+  __bastion_login_user=$(get_tf_output bastion_user)
+  exit_if_error $? "Locating bastion login user"
+
+  if [ -n "${__userhost_dst}" ] || [ -n "${__userhost_src}" ]; then
+    if [ -n "${__userhost_dst}" ]; then
+      IFS="@" read -r __user __host <<< "${__userhost_dst}"
+    else
+      # shellcheck disable=SC2034
+      IFS="@" read -r __user __host <<< "${__userhost_src}"
+    fi
+    __cmd+=("-o" "ProxyCommand='ssh -i ${bastion_dir}/${ssh_key_filename} -q -W ${__host}:22 ${__bastion_login_user}@${__bastion_host_address}'" "${__src}" "${__dst}")
+  elif [ "${args[cmd]}" == "upload" ]; then
+    __cmd+=("-i" "${bastion_dir}/${ssh_key_filename}" "${__src}" "${__bastion_login_user}@${__bastion_host_address}:${__dst}")
+  else
+    __cmd+=("-i" "${bastion_dir}/${ssh_key_filename}" "${__bastion_login_user}@${__bastion_host_address}:${__src}" "${__dst}")
+  fi
+  echo "${__cmd[*]}"
+}
+
 # run_tf runs the terraform apply operation to launch the instance.
 run_tf() {
   local __op=($@)
@@ -857,10 +935,27 @@ ssh_run() {
   eval "${__ssh_cmd}"
 }
 
+# scp_run uploads or downloads a local path to the bastion host using SCP, or
+# to a server behind it if supplied.
+scp_run() {
+  local __scp_cmd=""
+  check_for_running "true"
+
+  save_private_key
+  __scp_cmd=$(build_scp_command "${args[src]}" "${args[dst]}")
+  exit_if_error $? "Building SCP command"
+
+  message begin "==> Running SCP (${__scp_cmd}) <=="
+  eval "${__scp_cmd}"
+}
+
 arg_parse "$@"
 validate_cmd
 if [ "${args[cmd]}" == "launch" ]; then
   validate_launchargs
+fi
+if [ "${args[cmd]}" == "upload" ] || [ "${args[cmd]}" == "download" ]; then
+  validate_transferargs
 fi
 validate_sshargs
 
@@ -874,6 +969,9 @@ case "${args[cmd]}" in
     ;;
   terminate)
     terminate_run
+    ;;
+  upload|download)
+    scp_run
     ;;
   *)
     message error "ERROR: noop"
